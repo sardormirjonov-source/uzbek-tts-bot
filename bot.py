@@ -1,4 +1,4 @@
-import telebot
+eimport telebot
 import requests
 import os
 import uuid
@@ -8,8 +8,8 @@ import time
 from flask import Flask
 
 # --- SOZLAMALAR (Render'dan Environment Variable orqali olinadi) ---
-BOT_TOKEN = os.environ.get("8607852008:AAEkaAiAxAlhiHBqU9p0nGI5jiaVxNQePDU")
-AISHA_API_KEY = os.environ.get("zaNkDu1U.Vxf4q2rzuhB6rSa3QyTWA6kIMGfozQlE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+AISHA_API_KEY = os.environ.get("AISHA_API_KEY")
 AISHA_TTS_URL = "https://back.aisha.group/api/v1/tts/post/"
 
 bot = telebot.TeleBot(BOT_TOKEN)
