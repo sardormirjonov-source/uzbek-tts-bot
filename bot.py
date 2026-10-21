@@ -1,4 +1,4 @@
-eimport telebot
+import telebot
 import requests
 import os
 import uuid
