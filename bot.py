@@ -1,22 +1,22 @@
 import telebot
 import os
+import threading
 import re
 import asyncio
-from flask import Flask, request
+from flask import Flask
 from telebot import types
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from apify_client import ApifyClient
 
 # --- SOZLAMALAR ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")  # Apify'dan olgan tokeningiz
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# --- FLASK SERVER (Webhook uchun) ---
 app = Flask(__name__)
 
-# --- FLASK ROUTE (TELEGRAM WEBHOOK UCHUN) ---
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
 def receive_update():
-    """Telegram'dan kelgan xabarlarni qabul qiluvchi yo'l."""
     json_string = request.get_data().decode('utf-8')
     update = telebot.types.Update.de_json(json_string)
     bot.process_new_updates([update])
@@ -24,82 +24,66 @@ def receive_update():
 
 @app.route('/')
 def home():
-    return "OLX Smart Search Bot is alive (Webhook mode)!", 200
+    return "OLX Apify Bot is alive!", 200
 
-# --- OLX PARSER (PLAYWRIGHT) ---
-async def fetch_olx_html(url):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-        await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(7000)
-        html = await page.content()
-        await browser.close()
-        return html
-
-def search_olx_apartments(max_price_usd, chat_id):
-    url = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/tashkent/"
+# --- APIFY ORQALI OLX QIDIRUVI ---
+def search_olx_apartments_apify(max_price_usd, chat_id):
     try:
-        html = asyncio.run(fetch_olx_html(url))
-    except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Debug: Brauzer xatosi: {e}")
-        return []
-
-    soup = BeautifulSoup(html, 'html.parser')
-    ads = soup.select('div[data-cy="l-card"]')
-
-    if not ads:
-        page_title = soup.title.string if soup.title else "Sarlavha topilmadi"
-        is_cloudflare = "Just a moment" in html or "cf-challenge" in html or "Cloudflare" in html
-        html_size = len(html)
+        # Apify mijozi bilan ulanish
+        client = ApifyClient(APIFY_TOKEN)
         
-        debug_msg = (
-            f"🛑 **Debug hisobot:**\n"
-            f"• Sahifa nomi: `{page_title[:50]}`\n"
-            f"• HTML hajmi: `{html_size}` bayt\n"
-            f"• Cloudflare himoyasi: `{'Bor (Bloklangan)' if is_cloudflare else 'Yo\'q'}`"
-        )
-        bot.send_message(chat_id, debug_msg, parse_mode='HTML')
-        return []
-
-    results = []
-    for ad in ads:
-        try:
-            title_elem = ad.find('h6')
-            title = title_elem.text.strip() if title_elem else "Noma'lum uy"
+        # Skraper uchun sozlamalar (input)
+        run_input = {
+            "searchQuery": "kvartira sotiladi",  # Qidiruv so'zi
+            "olxDomain": "olx.uz",               # O'zbekiston domeni
+            "maxPages": 1,                       # Faqat 1-sahifani olish (tezroq va arzonroq)
+            "sortBy": "newest",                  # Eng yangi e'lonlar
+            "proxyConfiguration": { "useApifyProxy": True }
+        }
+        
+        # Skraperni ishga tushirish va tugashini kutish
+        print("Apify skraperi ishga tushirilmoqda...")
+        run = client.actor("daddyapi/olx-search-scraper").call(run_input=run_input)
+        
+        # Natijalarni (dataset) olish
+        dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
+        
+        results = []
+        for item in dataset_items:
+            # Apify qaytargan ma'lumotlardan keraklilarini ajratib olamiz
+            title = item.get("title", "Noma'lum uy")
+            price_text = item.get("price", "0")
+            location = item.get("location", "Manzil yo'q")
+            link = item.get("url", "")
             
-            price_elem = ad.find('p', attrs={'data-testid': 'ad-price'})
-            price_text = price_elem.text.strip() if price_elem else "0"
-            
-            location_elem = ad.find('p', attrs={'data-testid': 'location-date'})
-            location = location_elem.text.strip() if location_elem else "Manzil yo'q"
-            
-            link_elem = ad.find('a')
-            link = "https://www.olx.uz" + link_elem['href'] if link_elem and link_elem['href'].startswith('/') else (link_elem['href'] if link_elem else "")
-
-            price_text_lower = price_text.lower()
-            digits = re.sub(r'[^\d]', '', price_text)
+            # Narxni dollarga o'girish (taxminiy)
+            price_text_lower = str(price_text).lower()
+            digits = re.sub(r'[^\d]', '', str(price_text))
             price_num = int(digits) if digits else 0
             
-            if ("сум" in price_text_lower or "so'm" in price_text_lower) and price_num > 1000000:
+            if ("сум" in price_text_lower or "so'm" in price_text_lower or "uzs" in price_text_lower) and price_num > 1000000:
                 price_in_usd = int(price_num / 12600)
             else:
                 price_in_usd = price_num
 
+            # Byudjetga mos keladiganlarini tanlaymiz
             if 0 < price_in_usd <= max_price_usd:
-                results.append({"title": title, "price": price_text, "location": location, "link": link})
-        except Exception:
-            continue
+                results.append({
+                    "title": title,
+                    "price": price_text,
+                    "location": location,
+                    "link": link
+                })
+        
+        # Eng ko'pi bilan 5 ta natija qaytaramiz
+        return results[:5]
+        
+    except Exception as e:
+        print(f"Apify xatosi: {e}")
+        bot.send_message(chat_id, f"⚠️ Apify xatosi: {e}")
+        return []
 
-    return results[:5]
-
-# --- BOT LOGIKASI ---
+# --- BOT LOGIKASI (o'zgarishsiz qoladi) ---
 user_states = {}
 
 @bot.message_handler(commands=['start'])
@@ -119,33 +103,30 @@ def process_search(message):
     user_id = message.chat.id
     try:
         max_price = int(message.text)
-        loading_msg = bot.reply_to(message, "🔎 OLX tekshirilmoqda, 10-15 soniya kuting...")
-        results = search_olx_apartments(max_price, user_id)
+        loading_msg = bot.reply_to(message, "🔎 Apify orqali OLX tekshirilmoqda, biroz kuting...")
+        
+        results = search_olx_apartments_apify(max_price, user_id)
+        
         bot.delete_message(user_id, loading_msg.message_id)
         
         if not results:
-            bot.send_message(user_id, "Uy topilmadi yoki tizim bloklandi.")
+            bot.send_message(user_id, "Uy topilmadi yoki byudjetga mos keladigan e'lon yo'q.")
             return
             
         bot.send_message(user_id, f"🎉 {max_price}$ ga mos top 5 ta uy:")
         for res in results:
             text = f"🏠 **{res['title']}**\n💰 {res['price']}\n📍 {res['location']}\n🔗 [Ko'rish]({res['link']})"
             bot.send_message(user_id, text, parse_mode='Markdown', disable_web_page_preview=True)
-    except Exception:
-        bot.send_message(user_id, "Xatolik yuz berdi.")
+    except Exception as e:
+        bot.send_message(user_id, "Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
 
 # --- ISHGA TUSHIRISH ---
 if __name__ == "__main__":
-    # Render o'zining URL manzilini avtomatik taqdim etadi
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    
     if render_url:
-        # Eski webhookni o'chirib, yangisini o'rnatamiz
         bot.remove_webhook()
         bot.set_webhook(url=f"{render_url}/{BOT_TOKEN}")
-        print(f"Webhook o'rnatildi: {render_url}/{BOT_TOKEN}")
     
     print("Server ishga tushdi...")
     port = int(os.environ.get("PORT", 8080))
-    # endi bot.infinity_polling() yo'q! Faqat Flask ishlaydi.
     app.run(host='0.0.0.0', port=port)
