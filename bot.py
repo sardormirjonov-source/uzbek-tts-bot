@@ -1,5 +1,4 @@
 import telebot
-import requests
 import cloudscraper
 from bs4 import BeautifulSoup
 import os
@@ -24,22 +23,28 @@ def run_flask():
     app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 # --- OLX PARSER FUNKSIYASI ---
-def search_olx_apartments(max_price_usd):
+def search_olx_apartments(max_price_usd, chat_id):
+    """OLX'dan Toshkentdagi kvartiralarni qidiradi va narx bo'yicha filtrlaydi."""
     url = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/tashkent/"
-    scraper = cloudscraper.create_scraper() 
-        response = scraper.get(url, timeout=15)   
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
     
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-                soup = BeautifulSoup(response.text, 'html.parser')
+        # Cloudscraper orqali so'rov yuboramiz (Cloudflare blokini chetlab o'tish uchun)
+        scraper = cloudscraper.create_scraper()
+        response = scraper.get(url, timeout=20)
         
-        # OLX dagi e'lonlar blokini topamiz
+        # 1. Tekshiruv: Sayt ochildimi?
+        if response.status_code != 200:
+            bot.send_message(chat_id, f"⚠️ Debug: OLX bizni bloklayapti. Status kod: {response.status_code}")
+            return []
+            
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 2. Tekshiruv: E'lonlar bloki bormi?
         ads = soup.find_all('div', attrs={'data-cy': 'l-card'})
-        
+        if len(ads) == 0:
+            bot.send_message(chat_id, "⚠️ Debug: OLX sahifasi yuklandi, lekin uylar bloki (l-card) topilmadi. OLX dizaynni o'zgartirgan bo'lishi mumkin.")
+            return []
+            
         results = []
         for ad in ads:
             try:
@@ -47,7 +52,7 @@ def search_olx_apartments(max_price_usd):
                 title = title_elem.text.strip() if title_elem else "Noma'lum uy"
                 
                 price_elem = ad.find('p', attrs={'data-testid': 'ad-price'})
-                price_text = price_elem.text.strip() if price_elem else "Narx yo'q"
+                price_text = price_elem.text.strip() if price_elem else "0"
                 
                 location_elem = ad.find('p', attrs={'data-testid': 'location-date'})
                 location = location_elem.text.strip() if location_elem else "Manzil yo'q"
@@ -55,24 +60,19 @@ def search_olx_apartments(max_price_usd):
                 link_elem = ad.find('a')
                 link = "https://www.olx.uz" + link_elem['href'] if link_elem and link_elem['href'].startswith('/') else (link_elem['href'] if link_elem else "")
 
-                # Narxni raqamga ajratib olish (masalan, "$ 50 000" dan 50000 ni olish)
-                price_num = 0
-                if "so'm" in price_text or "у.е." in price_text or "$" in price_text:
-                    # Faqat raqamlarni qoldiramiz
-                    digits = re.sub(r'[^\d]', '', price_text)
-                    if digits:
-                        price_num = int(digits)
-                        # Agar narx so'mda berilgan bo'lsa va u juda katta bo'lsa (masalan 500 million so'm), uni dollarga o'tkazish shart emas, 
-                        # shunchaki foydalanuvchi kiritgan limit bilan solishtiramiz. 
-                        # Lekin soddalik uchun faqat raqamni tekshiramiz.
+                # 3. Narxni hisoblash
+                price_text_lower = price_text.lower()
+                digits = re.sub(r'[^\d]', '', price_text)
+                price_num = int(digits) if digits else 0
                 
-                # Agar foydalanuvchi dollar kiritgan bo'lsa, lekin e'lon so'mda bo'lsa, taxminiy konvertatsiya (1$ = 12600 so'm)
-                if "so'm" in price_text and price_num > 1000000:
-                    price_in_usd = int(price_num / 12600)
+                # Agar narx so'mda bo'lsa va raqam juda katta bo'lsa, taxminan dollorga o'giramiz
+                if ("сум" in price_text_lower or "so'm" in price_text_lower) and price_num > 1000000:
+                    price_in_usd = int(price_num / 12600) # 1$ = ~12600 so'm
                 else:
                     price_in_usd = price_num
 
-                if price_in_usd <= max_price_usd:
+                # Agar narx 0 dan katta bo'lsa va byudjetga to'g'ri kelsa
+                if 0 < price_in_usd <= max_price_usd:
                     results.append({
                         "title": title,
                         "price": price_text,
@@ -80,12 +80,14 @@ def search_olx_apartments(max_price_usd):
                         "link": link
                     })
             except Exception as e:
-                continue # Bitta e'londa xato bo'lsa, o'tkazib yuboramiz
+                continue # Bitta e'londa xato bo'lsa, keyingisiga o'tamiz
                 
         return results[:5] # Eng ko'pi bilan 5 ta natija qaytaramiz
+        
     except Exception as e:
         print(f"Scraping xatosi: {e}")
-        return None
+        bot.send_message(chat_id, f"⚠️ Debug: Tizim xatosi: {e}")
+        return []
 
 # --- BOT LOGIKASI ---
 user_states = {}
@@ -126,7 +128,8 @@ def process_search(message):
             
         loading_msg = bot.reply_to(message, "🔎 OLX'dan ma'lumotlar qidirilmoqda, biroz kuting...")
         
-        results = search_olx_apartments(max_price)
+        # Funksiyaga chat_id ni ham uzatamiz (Debug xabarlari uchun)
+        results = search_olx_apartments(max_price, user_id)
         
         bot.delete_message(user_id, loading_msg.message_id)
         
@@ -151,6 +154,8 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     print("Aqlli Qidiruv boti ishga tushdi...")
     try:
+        # Eski webhook va osilib qolgan so'rovlarni tozalash
+        import requests
         requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true")
     except:
         pass
