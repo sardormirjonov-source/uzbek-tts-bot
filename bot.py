@@ -1,332 +1,153 @@
 import telebot
 import requests
+from bs4 import BeautifulSoup
 import os
-import uuid
-import json
 import threading
-import sqlite3
-from datetime import date
-from flask import Flask, request, jsonify
-from paytechuz.gateways.payme import PaymeGateway
-from paytechuz.gateways.click import ClickGateway
+import re
+from flask import Flask
+from telebot import types
 
-# --- SOZLAMALAR (Render Environment Variables) ---
+# --- SOZLAMALAR ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-AISHA_API_KEY = os.environ.get("AISHA_API_KEY")
-AISHA_TTS_URL = "https://back.aisha.group/api/v1/tts/post/"
-
-# To'lov kalitlari (Hozircha test rejimi uchun)
-PAYME_ID = os.environ.get("PAYME_ID")
-PAYME_KEY = os.environ.get("PAYME_KEY")
-CLICK_SERVICE_ID = os.environ.get("CLICK_SERVICE_ID")
-CLICK_MERCHANT_ID = os.environ.get("CLICK_MERCHANT_ID")
-CLICK_MERCHANT_USER_ID = os.environ.get("CLICK_MERCHANT_USER_ID")
-CLICK_SECRET_KEY = os.environ.get("CLICK_SECRET_KEY")
-
-IS_TEST_MODE = True  # Test rejimi yoqilgan
-
-# --- LIMITLAR ---
-MAX_BELGI_PER_MSG = 150    # Bitta xabar uchun
-KUNLIK_BELGI_LIMIT = 300   # Bepul kunlik limit
-
-# Bot va Flask
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# --- FLASK SERVER (Render uxlab qolmasligi uchun) ---
 app = Flask(__name__)
 
-# To'lov shlyuzlarini ishga tushirish (Agar kalitlar kiritilgan bo'lsa)
-payme = PaymeGateway(payme_id=PAYME_ID, payme_key=PAYME_KEY, is_test_mode=IS_TEST_MODE) if PAYME_ID else None
-click = ClickGateway(
-    service_id=CLICK_SERVICE_ID,
-    merchant_id=CLICK_MERCHANT_ID,
-    merchant_user_id=CLICK_MERCHANT_USER_ID,
-    secret_key=CLICK_SECRET_KEY,
-    is_test_mode=IS_TEST_MODE,
-) if CLICK_SERVICE_ID else None
-
-# --- MA'LUMOTLAR BAZASI ---
-def init_db():
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            last_date TEXT,
-            used_chars INTEGER,
-            balance INTEGER DEFAULT 0
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS payments (
-            order_id TEXT PRIMARY KEY,
-            user_id INTEGER,
-            amount INTEGER,
-            status TEXT,
-            provider TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def get_user(user_id):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT last_date, used_chars, balance FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return {"last_date": row[0], "used_chars": row[1], "balance": row[2]}
-    return None
-
-def update_user(user_id, last_date, used_chars, balance):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO users (user_id, last_date, used_chars, balance) VALUES (?, ?, ?, ?)",
-        (user_id, last_date, used_chars, balance)
-    )
-    conn.commit()
-    conn.close()
-
-def check_limit(user_id, text_length):
-    today = str(date.today())
-    user = get_user(user_id)
-    if user is None:
-        update_user(user_id, today, text_length, 0)
-        return True, KUNLIK_BELGI_LIMIT - text_length
-    if user["last_date"] != today:
-        update_user(user_id, today, text_length, user["balance"])
-        return True, KUNLIK_BELGI_LIMIT - text_length
-    if user["used_chars"] + text_length <= KUNLIK_BELGI_LIMIT:
-        update_user(user_id, today, user["used_chars"] + text_length, user["balance"])
-        return True, KUNLIK_BELGI_LIMIT - (user["used_chars"] + text_length)
-    if user["balance"] >= text_length:
-        update_user(user_id, today, user["used_chars"], user["balance"] - text_length)
-        return True, 0
-    return False, 0
-
-def add_balance(user_id, amount):
-    user = get_user(user_id)
-    if user:
-        update_user(user_id, user["last_date"], user["used_chars"], user["balance"] + amount)
-    else:
-        update_user(user_id, str(date.today()), 0, amount)
-
-def create_payment_order(user_id, amount, provider):
-    order_id = str(uuid.uuid4())[:8] # Qisqaroq ID
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO payments (order_id, user_id, amount, status, provider) VALUES (?, ?, ?, ?, ?)",
-                   (order_id, user_id, amount, "pending", provider))
-    conn.commit()
-    conn.close()
-    return order_id
-
-def get_order(order_id):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, amount, status, provider FROM payments WHERE order_id = ?", (order_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row
-
-def update_order_status(order_id, status):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE payments SET status = ? WHERE order_id = ?", (status, order_id))
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# --- FLASK SERVER VA WEBHOOK'LAR ---
 @app.route('/')
 def home():
-    return "Bot is alive!", 200
-
-@app.route('/payme/webhook', methods=['POST'])
-def payme_webhook():
-    data = request.get_json()
-    method = data.get("method")
-    params = data.get("params", {})
-    order_id = params.get("account", {}).get("order_id") or params.get("account", {}).get("id")
-
-    if method == "CheckPerformTransaction":
-        order = get_order(order_id)
-        if order and order[2] == "pending":
-            return jsonify({"result": {"allow": True}})
-        return jsonify({"error": {"code": -31050, "message": "Order not found"}})
-
-    if method == "CreateTransaction":
-        order = get_order(order_id)
-        if order and order[2] == "pending":
-            update_order_status(order_id, "created")
-            return jsonify({"result": {"create_time": 0, "transaction": order_id, "state": 1}})
-        return jsonify({"error": {"code": -31050, "message": "Order not found"}})
-
-    if method == "PerformTransaction":
-        order = get_order(order_id)
-        if order and order[2] == "created":
-            update_order_status(order_id, "performed")
-            add_balance(order[0], order[1])
-            try:
-                bot.send_message(order[0], f"✅ To'lov muvaffaqiyatli! Balansingizga {order[1]} so'm qo'shildi.")
-            except: pass
-            return jsonify({"result": {"perform_time": 0, "transaction": order_id, "state": 2}})
-        return jsonify({"error": {"code": -31050, "message": "Order not found"}})
-
-    return jsonify({"error": {"code": -32601, "message": "Method not found"}})
-
-@app.route('/click/webhook', methods=['POST'])
-def click_webhook():
-    data = request.form.to_dict() # Click form-data yuboradi
-    action = data.get("action")
-    order_id = data.get("merchant_trans_id")
-
-    if action == "0":  # Prepare
-        order = get_order(order_id)
-        if order and order[2] == "pending":
-            return jsonify({"error": 0, "error_note": "Success"})
-        return jsonify({"error": -1, "error_note": "Order not found"})
-
-    if action == "1":  # Complete
-        order = get_order(order_id)
-        if order and order[2] == "pending":
-            update_order_status(order_id, "completed")
-            add_balance(order[0], order[1])
-            try:
-                bot.send_message(order[0], f"✅ To'lov muvaffaqiyatli! Balansingizga {order[1]} so'm qo'shildi.")
-            except: pass
-            return jsonify({"error": 0, "error_note": "Success"})
-        return jsonify({"error": -1, "error_note": "Order not found"})
-
-    return jsonify({"error": -1, "error_note": "Unknown action"})
+    return "Smart Search Bot is alive!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, use_reloader=False)
 
+# --- OLX PARSER FUNKSIYASI ---
+def search_olx_apartments(max_price_usd):
+    """OLX'dan Toshkentdagi kvartiralarni qidiradi va narx bo'yicha filtrlaydi."""
+    url = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/tashkent/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # OLX dagi e'lonlar blokini topamiz
+        ads = soup.find_all('div', attrs={'data-cy': 'l-card'})
+        
+        results = []
+        for ad in ads:
+            try:
+                title_elem = ad.find('h6')
+                title = title_elem.text.strip() if title_elem else "Noma'lum uy"
+                
+                price_elem = ad.find('p', attrs={'data-testid': 'ad-price'})
+                price_text = price_elem.text.strip() if price_elem else "Narx yo'q"
+                
+                location_elem = ad.find('p', attrs={'data-testid': 'location-date'})
+                location = location_elem.text.strip() if location_elem else "Manzil yo'q"
+                
+                link_elem = ad.find('a')
+                link = "https://www.olx.uz" + link_elem['href'] if link_elem and link_elem['href'].startswith('/') else (link_elem['href'] if link_elem else "")
+
+                # Narxni raqamga ajratib olish (masalan, "$ 50 000" dan 50000 ni olish)
+                price_num = 0
+                if "so'm" in price_text or "у.е." in price_text or "$" in price_text:
+                    # Faqat raqamlarni qoldiramiz
+                    digits = re.sub(r'[^\d]', '', price_text)
+                    if digits:
+                        price_num = int(digits)
+                        # Agar narx so'mda berilgan bo'lsa va u juda katta bo'lsa (masalan 500 million so'm), uni dollarga o'tkazish shart emas, 
+                        # shunchaki foydalanuvchi kiritgan limit bilan solishtiramiz. 
+                        # Lekin soddalik uchun faqat raqamni tekshiramiz.
+                
+                # Agar foydalanuvchi dollar kiritgan bo'lsa, lekin e'lon so'mda bo'lsa, taxminiy konvertatsiya (1$ = 12600 so'm)
+                if "so'm" in price_text and price_num > 1000000:
+                    price_in_usd = int(price_num / 12600)
+                else:
+                    price_in_usd = price_num
+
+                if price_in_usd <= max_price_usd:
+                    results.append({
+                        "title": title,
+                        "price": price_text,
+                        "location": location,
+                        "link": link
+                    })
+            except Exception as e:
+                continue # Bitta e'londa xato bo'lsa, o'tkazib yuboramiz
+                
+        return results[:5] # Eng ko'pi bilan 5 ta natija qaytaramiz
+    except Exception as e:
+        print(f"Scraping xatosi: {e}")
+        return None
+
 # --- BOT LOGIKASI ---
+user_states = {}
+
 @bot.message_handler(commands=['start'])
 def start_handler(message):
-    bot.reply_to(
-        message,
-        f"Salom! Menga matn yuboring, men uni Aisha AI orqali ovozga aylantiraman. 🎙️\n\n"
-        f"📌 **Qoidalar:**\n"
-        f"• Bitta xabar uchun: {MAX_BELGI_PER_MSG} belgi\n"
-        f"• Kunlik bepul limit: {KUNLIK_BELGI_LIMIT} belgi\n\n"
-        f"Balansni to'ldirish uchun /balance buyrug'ini bosing."
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    btn = types.KeyboardButton("🏠 Kvartira qidirish")
+    markup.add(btn)
+    
+    bot.send_message(
+        message.chat.id,
+        "Salom! Men OLX'dan sizga eng mos uylarni topib beruvchi aqlli botman. 🕵️‍♂️\n\n"
+        "Hozircha faqat Toshkentdagi sotilayotgan kvartiralarni qidiraman.\n"
+        "Boshlash uchun pastdagi tugmani bosing.",
+        reply_markup=markup
     )
 
-@bot.message_handler(commands=['balance'])
-def balance_handler(message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    balans = user["balance"] if user else 0
-    markup = telebot.types.InlineKeyboardMarkup()
-    
-    if payme:
-        markup.add(telebot.types.InlineKeyboardButton("Payme (Test)", callback_data="pay_payme"))
-    if click:
-        markup.add(telebot.types.InlineKeyboardButton("Click (Test)", callback_data="pay_click"))
+@bot.message_handler(func=lambda message: message.text == "🏠 Kvartira qidirish")
+def ask_price(message):
+    user_states[message.chat.id] = {'state': 'waiting_for_price'}
+    msg = bot.send_message(
+        message.chat.id, 
+        "Qancha byudjetingiz bor? (Dollarda kiriting, masalan: 50000)\n"
+        "Faqat raqam yozing:"
+    )
+    bot.register_next_step_handler(msg, process_search)
+
+def process_search(message):
+    user_id = message.chat.id
+    if user_id not in user_states or user_states[user_id].get('state') != 'waiting_for_price':
+        return
         
-    bot.reply_to(message, f"💰 Joriy balansingiz: {balans} so'm\n\nTo'lov usulini tanlang:", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
-def payment_callback(call):
-    user_id = call.from_user.id
-    provider = call.data.split("_")[1]
-    amount = 5000  # Test uchun 5000 so'm
-    order_id = create_payment_order(user_id, amount, provider)
-
     try:
-        if provider == "payme" and payme:
-            link = payme.create_payment(
-                id=order_id,
-                amount=amount,
-                return_url=f"https://t.me/{bot.get_me().username}",
-                account_field_name="order_id",
-            )
-        elif provider == "click" and click:
-            link = click.create_payment(
-                id=order_id,
-                amount=amount,
-                description=f"Balans to'ldirish",
-                return_url=f"https://t.me/{bot.get_me().username}",
-            )
-        else:
-            bot.answer_callback_query(call.id, "To'lov tizimi sozlanmagan.")
-            return
-
-        bot.send_message(user_id, f"To'lov havolasi:\n{link}\n\nTo'lovni amalga oshirgach, balansingiz avtomatik yangilanadi.")
-    except Exception as e:
-        print(f"To'lov yaratishda xatolik: {e}")
-        bot.send_message(user_id, "To'lov havolasini yaratishda xatolik yuz berdi.")
-
-@bot.message_handler(func=lambda message: True, content_types=['text'])
-def text_handler(message):
-    user_id = message.from_user.id
-    matn = message.text.strip()
-    if not matn:
-        return
-
-    if len(matn) > MAX_BELGI_PER_MSG:
-        bot.reply_to(message, f"⚠️ Kechirasiz, bitta xabarda maksimal {MAX_BELGI_PER_MSG} belgi yuborishingiz mumkin.")
-        return
-
-    ruxsat, qolgan_belgi = check_limit(user_id, len(matn))
-    if not ruxsat:
-        bot.reply_to(message, "Kechirasiz, bugungi bepul limitingiz tugadi. /balance orqali balansni to'ldiring.")
-        return
-
-    vaqtinchalik_fayl = f"{uuid.uuid4()}.mp3"
-    yuklanmoqda = bot.reply_to(message, f"Ovoz yaratilmoqda... ⏳\n(Qolgan bepul limit: {qolgan_belgi} belgi)")
-
-    try:
-        headers = {"X-Api-Key": AISHA_API_KEY, "Accept-Language": "uz"}
-        files = {
-            'transcript': (None, matn),
-            'language': (None, 'uz'),
-            'model': (None, 'Gulnoza'),
-            'mood': (None, 'Neutral'),
-            'speed': (None, '1.0')
-        }
-        response = requests.post(AISHA_TTS_URL, files=files, headers=headers, timeout=20)
-        response.raise_for_status()
-        javob_json = response.json()
-        audio_url = javob_json.get('audio_path') or javob_json.get('url') or javob_json.get('audio_url') or javob_json.get('result')
+        max_price = int(message.text)
+        if max_price <= 0:
+            raise ValueError
+            
+        loading_msg = bot.reply_to(message, "🔎 OLX'dan ma'lumotlar qidirilmoqda, biroz kuting...")
         
-        if isinstance(audio_url, dict):
-            audio_url = audio_url.get('url') or audio_url.get('audio_path')
-        if not audio_url:
-            bot.reply_to(message, "API dan audio havolasi topilmadi.")
+        results = search_olx_apartments(max_price)
+        
+        bot.delete_message(user_id, loading_msg.message_id)
+        
+        if not results:
+            bot.send_message(user_id, "Afsuski, sizning byudjetingizga mos uy topilmadi. Boshqa narx kiriting yoki keyinroq urinib ko'ring.")
             return
             
-        if audio_url.startswith('/'):
-            audio_url = "https://back.aisha.group" + audio_url
-        elif not audio_url.startswith('http'):
-            audio_url = "https://back.aisha.group/media/" + audio_url
-            
-        audio_response = requests.get(audio_url, timeout=20)
-        audio_response.raise_for_status()
+        bot.send_message(user_id, f"🎉 Sizning byudjetingizga ({max_price}$) mos keladigan top 5 ta uy:")
         
-        with open(vaqtinchalik_fayl, 'wb') as f:
-            f.write(audio_response.content)
+        for res in results:
+            text = f"🏠 **{res['title']}**\n💰 {res['price']}\n📍 {res['location']}\n🔗 [E'lonni ko'rish]({res['link']})"
+            bot.send_message(user_id, text, parse_mode='Markdown', disable_web_page_preview=True)
             
-        with open(vaqtinchalik_fayl, 'rb') as audio:
-            bot.send_audio(message.chat.id, audio, title="Aisha AI (Gulnoza)")
-            
-    except Exception as xato:
-        print(f"Xatolik: {xato}")
-        bot.reply_to(message, "Kechirasiz, texnik xatolik yuz berdi.")
+    except ValueError:
+        bot.send_message(user_id, "Iltimos, faqat raqam kiriting (masalan: 50000).")
     finally:
-        if os.path.exists(vaqtinchalik_fayl):
-            os.remove(vaqtinchalik_fayl)
-        bot.delete_message(yuklanmoqda.chat.id, yuklanmoqda.message_id)
+        if user_id in user_states:
+            del user_states[user_id]
 
 # --- ISHGA TUSHIRISH ---
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Bot ishga tushdi...")
+    print("Aqlli Qidiruv boti ishga tushdi...")
     try:
         requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true")
     except:
