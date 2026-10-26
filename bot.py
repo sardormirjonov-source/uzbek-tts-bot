@@ -25,24 +25,28 @@ async def fetch_olx_html(url):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process"
-            ]
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
-        await page.goto(url, timeout=30000, wait_until="networkidle")
-        await page.wait_for_timeout(3000)
+        
+        # 'networkidle' o'rniga 'domcontentloaded' ishlatamiz
+        await page.goto(url, timeout=60000, wait_until="domcontentloaded") 
+        
+        # Sahifa to'liq yuklanishi uchun qo'shimcha 7 soniya kutamiz
+        await page.wait_for_timeout(7000) 
+        
+        # Sahifada e'lonlar bloki paydo bo'lishini kutamiz (agar 10 soniyada chiqmasa, xato beradi)
+        try:
+            await page.wait_for_selector('div[data-cy="l-card"]', timeout=10000)
+        except Exception:
+            pass # Topilmasa ham davom etamiz, pastda tekshiramiz
+            
         html = await page.content()
         await browser.close()
         return html
-
 def search_olx_apartments(max_price_usd, chat_id):
     url = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/tashkent/"
     try:
@@ -53,14 +57,16 @@ def search_olx_apartments(max_price_usd, chat_id):
 
     soup = BeautifulSoup(html, 'html.parser')
     # Bir nechta selektorni sinab ko'ramiz
-    ads = soup.select('div[data-cy="l-card"]') or \
-          soup.select('div[data-testid="l-card"]') or \
-          soup.select('div[class*="card"]')
+    ads = soup.select('div[data-cy="l-card"]')
+# Agar l-card topilmasa, boshqa selektorlarni ham sinab ko'ramiz
+if not ads:
+    ads = soup.select('div[class*="card"]') # Zaxira selektor
 
-    if not ads:
-        bot.send_message(chat_id, "⚠️ Debug: E'lonlar bloki topilmadi. OLX dizayni o'zgargan bo'lishi mumkin.")
-        return []
-
+if not ads:
+    # Debug: HTMLning bir qismini ko'rsatamiz
+    debug_html = soup.prettify()[:1000] 
+    bot.send_message(chat_id, f"⚠️ Debug: l-card topilmadi. HTML boshlanishi:\n\n<code>{debug_html}</code>", parse_mode='HTML')
+    return []
     results = []
     for ad in ads:
         try:
