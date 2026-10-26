@@ -3,13 +3,13 @@ import os
 import threading
 import re
 import asyncio
-from flask import Flask
+from flask import Flask, request # <-- BU YERDA 'request' QO'SHILDI
 from telebot import types
 from apify_client import ApifyClient
 
 # --- SOZLAMALAR ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-APIFY_TOKEN = os.environ.get("APIFY_TOKEN")  # Apify'dan olgan tokeningiz
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # --- FLASK SERVER (Webhook uchun) ---
@@ -17,6 +17,7 @@ app = Flask(__name__)
 
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
 def receive_update():
+    """Telegram'dan kelgan xabarlarni qabul qiluvchi yo'l."""
     json_string = request.get_data().decode('utf-8')
     update = telebot.types.Update.de_json(json_string)
     bot.process_new_updates([update])
@@ -29,34 +30,29 @@ def home():
 # --- APIFY ORQALI OLX QIDIRUVI ---
 def search_olx_apartments_apify(max_price_usd, chat_id):
     try:
-        # Apify mijozi bilan ulanish
         client = ApifyClient(APIFY_TOKEN)
         
         # Skraper uchun sozlamalar (input)
         run_input = {
-            "searchQuery": "kvartira sotiladi",  # Qidiruv so'zi
-            "olxDomain": "olx.uz",               # O'zbekiston domeni
-            "maxPages": 1,                       # Faqat 1-sahifani olish (tezroq va arzonroq)
-            "sortBy": "newest",                  # Eng yangi e'lonlar
+            "searchQuery": "kvartira sotiladi",
+            "olxDomain": "olx.uz",
+            "maxPages": 1,
+            "sortBy": "newest",
             "proxyConfiguration": { "useApifyProxy": True }
         }
         
-        # Skraperni ishga tushirish va tugashini kutish
         print("Apify skraperi ishga tushirilmoqda...")
         run = client.actor("daddyapi/olx-search-scraper").call(run_input=run_input)
         
-        # Natijalarni (dataset) olish
         dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
         
         results = []
         for item in dataset_items:
-            # Apify qaytargan ma'lumotlardan keraklilarini ajratib olamiz
             title = item.get("title", "Noma'lum uy")
             price_text = item.get("price", "0")
             location = item.get("location", "Manzil yo'q")
             link = item.get("url", "")
             
-            # Narxni dollarga o'girish (taxminiy)
             price_text_lower = str(price_text).lower()
             digits = re.sub(r'[^\d]', '', str(price_text))
             price_num = int(digits) if digits else 0
@@ -66,7 +62,6 @@ def search_olx_apartments_apify(max_price_usd, chat_id):
             else:
                 price_in_usd = price_num
 
-            # Byudjetga mos keladiganlarini tanlaymiz
             if 0 < price_in_usd <= max_price_usd:
                 results.append({
                     "title": title,
@@ -75,7 +70,6 @@ def search_olx_apartments_apify(max_price_usd, chat_id):
                     "link": link
                 })
         
-        # Eng ko'pi bilan 5 ta natija qaytaramiz
         return results[:5]
         
     except Exception as e:
@@ -83,7 +77,7 @@ def search_olx_apartments_apify(max_price_usd, chat_id):
         bot.send_message(chat_id, f"⚠️ Apify xatosi: {e}")
         return []
 
-# --- BOT LOGIKASI (o'zgarishsiz qoladi) ---
+# --- BOT LOGIKASI ---
 user_states = {}
 
 @bot.message_handler(commands=['start'])
@@ -103,7 +97,7 @@ def process_search(message):
     user_id = message.chat.id
     try:
         max_price = int(message.text)
-        loading_msg = bot.reply_to(message, "🔎 Apify orqali OLX tekshirilmoqda, biroz kuting...")
+        loading_msg = bot.reply_to(message, "🔎 Apify orqali OLX tekshirilmoqda, biroz kuting (10-15 soniya)...")
         
         results = search_olx_apartments_apify(max_price, user_id)
         
@@ -118,7 +112,8 @@ def process_search(message):
             text = f"🏠 **{res['title']}**\n💰 {res['price']}\n📍 {res['location']}\n🔗 [Ko'rish]({res['link']})"
             bot.send_message(user_id, text, parse_mode='Markdown', disable_web_page_preview=True)
     except Exception as e:
-        bot.send_message(user_id, "Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
+        bot.send_message(user_id, "Xatolik yuz berdi. Iltimos, faqat raqam kiriting.")
+        print(f"Xatolik: {e}")
 
 # --- ISHGA TUSHIRISH ---
 if __name__ == "__main__":
@@ -126,6 +121,7 @@ if __name__ == "__main__":
     if render_url:
         bot.remove_webhook()
         bot.set_webhook(url=f"{render_url}/{BOT_TOKEN}")
+        print(f"Webhook o'rnatildi: {render_url}/{BOT_TOKEN}")
     
     print("Server ishga tushdi...")
     port = int(os.environ.get("PORT", 8080))
