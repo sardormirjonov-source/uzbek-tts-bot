@@ -1,5 +1,6 @@
 import telebot
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import os
 import threading
@@ -24,8 +25,9 @@ def run_flask():
 
 # --- OLX PARSER FUNKSIYASI ---
 def search_olx_apartments(max_price_usd):
-    """OLX'dan Toshkentdagi kvartiralarni qidiradi va narx bo'yicha filtrlaydi."""
     url = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/tashkent/"
+    scraper = cloudscraper.create_scraper() 
+        response = scraper.get(url, timeout=15)   
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -33,7 +35,7 @@ def search_olx_apartments(max_price_usd):
     try:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
+                soup = BeautifulSoup(response.text, 'html.parser')
         
         # OLX dagi e'lonlar blokini topamiz
         ads = soup.find_all('div', attrs={'data-cy': 'l-card'})
