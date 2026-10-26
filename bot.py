@@ -44,7 +44,7 @@ def search_olx_apartments_apify(max_price_usd, chat_id):
         print("Apify skraperi ishga tushirilmoqda...")
         run = client.actor("daddyapi/olx-search-scraper").call(run_input=run_input)
         
-        dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
+        dataset_items = client.dataset(run.default_dataset_id).list_items().items
         
         results = []
         for item in dataset_items:
