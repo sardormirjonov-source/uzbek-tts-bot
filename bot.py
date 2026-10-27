@@ -15,7 +15,6 @@ APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# Tumanlar ro'yxati va ularning ruscha muqobillari (qidiruv uchun)
 DISTRICT_MAP = {
     "Chilonzor": ["Chilonzor", "Чиланзар"],
     "Yunusobod": ["Yunusobod", "Юнусабад", "Юнусобод"],
@@ -30,7 +29,7 @@ DISTRICT_MAP = {
     "Yashnobod": ["Yashnobod", "Яшнабад"]
 }
 
-# --- MA'LUMOTLAR BAZASI (KESHLASH) ---
+# --- MA'LUMOTLAR BAZASI ---
 def init_db():
     conn = sqlite3.connect('olx_cache.db')
     c = conn.cursor()
@@ -88,7 +87,6 @@ def search_db(max_price_usd, district):
     if district == "Hammasi":
         c.execute('SELECT title, price_str, location, link, image FROM listings WHERE price_usd <= ? ORDER BY price_usd ASC', (max_price_usd,))
     else:
-        # Ham o'zbekcha, ham ruscha nomlar bo'yicha qidiramiz
         names = DISTRICT_MAP.get(district, [district])
         like_queries = " OR ".join(["location LIKE ?"] * len(names))
         params = [f'%{name}%' for name in names]
@@ -98,11 +96,8 @@ def search_db(max_price_usd, district):
         c.execute(query, tuple(params))
         
     results = c.fetchall()
-    
-    # Bazada jami qancha e'lon borligini tekshiramiz
     c.execute('SELECT COUNT(*) FROM listings')
     total_in_db = c.fetchone()[0]
-    
     conn.close()
     return results, total_in_db
 
@@ -124,8 +119,6 @@ def background_scraper():
             save_to_db(items)
         except Exception as e:
             print(f"Fon yuklashda xatolik: {e}")
-        
-        print("Keyingi yuklash 2 soatdan keyin...")
         time.sleep(7200)
 
 # --- FLASK SERVER ---
@@ -147,11 +140,27 @@ user_states = {}
 def start_handler(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(types.KeyboardButton("🏠 Kvartira qidirish"))
-    bot.send_message(
-        message.chat.id, 
-        "Assalomu alaykum! 👋\n\nMen <b>OLX Tezkor Qidiruv</b> botiman. 🕵️‍♂️\nEndi qidiruvlar <b>0 soniya</b> vaqt oladi!\nBoshlash uchun pastdagi tugmani bosing 👇", 
-        reply_markup=markup, parse_mode='HTML'
-    )
+    bot.send_message(message.chat.id, "Assalomu alaykum! 👋\n\nMen <b>OLX Tezkor Qidiruv</b> botiman. 🕵️‍♂️\nBoshlash uchun pastdagi tugmani bosing 👇", reply_markup=markup, parse_mode='HTML')
+
+# DEBUG BUYRUG'I
+@bot.message_handler(commands=['debug'])
+def debug_handler(message):
+    conn = sqlite3.connect('olx_cache.db')
+    c = conn.cursor()
+    c.execute('SELECT title, location, price_str, price_usd FROM listings LIMIT 5')
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        bot.send_message(message.chat.id, "Baza bo'sh.")
+        return
+        
+    text = "🛠 <b>Bazadagi dastlabki 5 ta e'lon:</b>\n\n"
+    for row in rows:
+        title, loc, p_str, p_usd = row
+        text += f"🏢 {title[:20]}...\n📍 <b>Manzil:</b> {loc}\n💰 <b>Narx:</b> {p_str} (Hisoblandi: {p_usd}$)\n\n"
+    
+    bot.send_message(message.chat.id, text, parse_mode='HTML')
 
 @bot.message_handler(func=lambda message: message.text == "🏠 Kvartira qidirish")
 def ask_budget(message):
@@ -164,7 +173,6 @@ def ask_district(message):
     try:
         max_price = int(message.text)
         if max_price <= 0: raise ValueError
-        
         user_states[user_id] = {'state': 'waiting_for_district', 'budget': max_price}
         
         markup = types.InlineKeyboardMarkup(row_width=2)
@@ -191,47 +199,30 @@ def handle_district_choice(call):
     
     results, total_in_db = search_db(max_price, district)
     
-    # Agar baza umuman bo'sh bo'lsa (yangi deploy bo'lgan bo'lsa)
     if total_in_db == 0:
-        bot.edit_message_text(
-            chat_id=user_id, message_id=call.message.message_id, 
-            text=f"⏳ <b>Ma'lumotlar bazasi hozir yuklanmoqda...</b>\n\n"
-                 f"Server yaqinda ishga tushgani uchun OLX'dan ma'lumotlar yuklanmoqda. "
-                 f"Iltimos, <b>15 soniyadan so'ng</b> qaytadan urinib ko'ring.", 
-            parse_mode='HTML'
-        )
+        bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id, text="⏳ <b>Ma'lumotlar bazasi hozir yuklanmoqda...</b>\n\nIltimos, 15 soniyadan so'ng qaytadan urinib ko'ring.", parse_mode='HTML')
         return
     
     if not results:
-        bot.edit_message_text(
-            chat_id=user_id, message_id=call.message.message_id, 
+        bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id, 
             text=f"🎉 <b>{district}</b> tumanidan <b>{max_price}$</b> gacha topilgan uylar (Jami: 0 ta):\n\n"
                  f"😔 Afsuski, hozircha bu tumandan mos uy topilmadi.\n"
-                 f"<i>(Bazada jami {total_in_db} ta uy bor, lekin ular narxga yoki tumanga mos kelmadi).</i>", 
-            parse_mode='HTML'
-        )
+                 f"<i>(Bazada jami {total_in_db} ta uy bor).</i>\n\n"
+                 f"<b>Tekshirish uchun /debug buyrug'ini bosing.</b>", parse_mode='HTML')
         return
         
-    bot.edit_message_text(
-        chat_id=user_id, message_id=call.message.message_id, 
-        text=f"🎉 <b>{district}</b> tumanidan <b>{max_price}$</b> gacha topilgan uylar (Jami: {len(results)} ta):", 
-        parse_mode='HTML'
-    )
+    bot.edit_message_text(chat_id=user_id, message_id=call.message.message_id, text=f"🎉 <b>{district}</b> tumanidan <b>{max_price}$</b> gacha topilgan uylar (Jami: {len(results)} ta):", parse_mode='HTML')
     
     for res in results[:15]:
         title, price_str, location, link, image = res
         text = f"🏢 <b>{title}</b>\n\n💵 Narxi: <code>{price_str}</code>\n📍 Manzil: {location}\n"
         markup = types.InlineKeyboardMarkup()
-        if link:
-            markup.add(types.InlineKeyboardButton("🔗 E'lonni ko'rish", url=link))
+        if link: markup.add(types.InlineKeyboardButton("🔗 E'lonni ko'rish", url=link))
         
         if image and str(image).startswith('http'):
-            try:
-                bot.send_photo(user_id, photo=image, caption=text, parse_mode='HTML', reply_markup=markup)
-            except:
-                bot.send_message(user_id, text, parse_mode='HTML', reply_markup=markup, disable_web_page_preview=True)
-        else:
-            bot.send_message(user_id, text, parse_mode='HTML', reply_markup=markup, disable_web_page_preview=True)
+            try: bot.send_photo(user_id, photo=image, caption=text, parse_mode='HTML', reply_markup=markup)
+            except: bot.send_message(user_id, text, parse_mode='HTML', reply_markup=markup, disable_web_page_preview=True)
+        else: bot.send_message(user_id, text, parse_mode='HTML', reply_markup=markup, disable_web_page_preview=True)
         time.sleep(0.4) 
         
     bot.send_message(user_id, "Yana qidirish uchun pastdagi tugmani bosing 👇", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add(types.KeyboardButton("🏠 Kvartira qidirish")))
@@ -246,8 +237,6 @@ if __name__ == "__main__":
     if render_url:
         bot.remove_webhook()
         bot.set_webhook(url=f"{render_url}/{BOT_TOKEN}")
-        print(f"Webhook o'rnatildi: {render_url}/{BOT_TOKEN}")
     
-    print("Server ishga tushdi...")
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
