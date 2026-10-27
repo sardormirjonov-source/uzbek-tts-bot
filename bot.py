@@ -31,10 +31,19 @@ DISTRICT_MAP = {
 # --- MANZILNI AJRATIB OLISH FUNKSIYASI ---
 def extract_location(item):
     """
-    Apify JSON dan barcha mumkin bo'lgan manzil maydonlarini tekshiradi.
-    Agar topilmasa — title dan tuman nomini ajratib oladi.
+    Apify dan manzilni maksimal darajada to'g'ri olish.
+    Shahar nomini (Тошкент) e'tiborsiz qoldirib, tuman nomini afzal ko'radi.
     """
-    # 1. Oddiy string maydonlar
+    title = str(item.get("title") or item.get("name") or "")
+    title_lower = title.lower()
+
+    # 1. Avval TITLE dan tuman qidiramiz (eng ishonchli manba)
+    for district_name, variants in DISTRICT_MAP.items():
+        for variant in variants:
+            if variant.lower() in title_lower:
+                return district_name
+
+    # 2. Location maydonlarini tekshiramiz
     candidates = [
         item.get("location"),
         item.get("city"),
@@ -46,32 +55,38 @@ def extract_location(item):
 
     for cand in candidates:
         if isinstance(cand, str) and cand.strip():
-            return cand.strip()
-        # Agar dict bo'lsa (Apify ba'zan shunday qaytaradi)
+            loc = cand.strip()
+            loc_lower = loc.lower()
+
+            # Agar faqat shahar nomi bo'lsa — o'tkazib yuboramiz
+            if loc_lower in ["тошкент", "tashkent", "ташкент", "toshkent"]:
+                continue
+
+            # Tuman bormi deb tekshiramiz
+            for district_name, variants in DISTRICT_MAP.items():
+                for variant in variants:
+                    if variant.lower() in loc_lower:
+                        return district_name
+
+            # Agar tuman topilmasa, lekin "Тошкент" emas bo'lsa — shuni qaytaramiz
+            return loc
+
+        # Dict bo'lsa
         if isinstance(cand, dict):
-            for key in ["name", "city", "district", "region", "address", "text"]:
+            for key in ["district", "name", "city", "region", "address", "text"]:
                 val = cand.get(key)
                 if isinstance(val, str) and val.strip():
-                    return val.strip()
+                    val_lower = val.strip().lower()
+                    if val_lower not in ["тошкент", "tashkent", "ташкент", "toshkent"]:
+                        # Tuman bormi?
+                        for district_name, variants in DISTRICT_MAP.items():
+                            for variant in variants:
+                                if variant.lower() in val_lower:
+                                    return district_name
+                        return val.strip()
 
-    # 2. Nested location obyekti
-    loc_obj = item.get("location")
-    if isinstance(loc_obj, dict):
-        for key in ["city", "district", "region", "name", "address"]:
-            val = loc_obj.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-
-    # 3. Title dan tuman ajratib olish
-    title = str(item.get("title") or item.get("name") or "")
-    title_lower = title.lower()
-
-    for district_name, variants in DISTRICT_MAP.items():
-        for variant in variants:
-            if variant.lower() in title_lower:
-                return district_name   # Standart nomni qaytaramiz
-
-    return ""   # Hech narsa topilmasa
+    # 3. Hech narsa topilmasa
+    return ""
 
 
 # --- MA'LUMOTLAR BAZASI ---
