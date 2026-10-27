@@ -15,13 +15,22 @@ APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-TASHKENT_DISTRICTS = [
-    "Chilonzor", "Yunusobod", "Mirzo Ulug'bek", "Yakkasaroy", 
-    "Shayxontohur", "Uchtepa", "Olmazor", "Sergeli", 
-    "Bektemir", "Mirobod", "Yashnobod", "Hammasi"
-]
+# Tumanlar ro'yxati va ularning ruscha muqobillari (qidiruv uchun)
+DISTRICT_MAP = {
+    "Chilonzor": ["Chilonzor", "Чиланзар"],
+    "Yunusobod": ["Yunusobod", "Юнусабад", "Юнусобод"],
+    "Mirzo Ulug'bek": ["Mirzo Ulug'bek", "Мирзо Улугбек"],
+    "Yakkasaroy": ["Yakkasaroy", "Яккасарай"],
+    "Shayxontohur": ["Shayxontohur", "Шайхантахур", "Шайхонтохур"],
+    "Uchtepa": ["Uchtepa", "Учтепа"],
+    "Olmazor": ["Olmazor", "Алмазар"],
+    "Sergeli": ["Sergeli", "Сергели"],
+    "Bektemir": ["Bektemir", "Бектемир"],
+    "Mirobod": ["Mirobod", "Мирабад"],
+    "Yashnobod": ["Yashnobod", "Яшнабад"]
+}
 
-# --- 1. MA'LUMOTLAR BAZASI (KESHLASH) ---
+# --- MA'LUMOTLAR BAZASI (KESHLASH) ---
 def init_db():
     conn = sqlite3.connect('olx_cache.db')
     c = conn.cursor()
@@ -42,7 +51,6 @@ def init_db():
 def save_to_db(items):
     conn = sqlite3.connect('olx_cache.db')
     c = conn.cursor()
-    # Eski ma'lumotlarni tozalab, yangisini yozamiz
     c.execute('DELETE FROM listings')
     
     for item in items:
@@ -80,15 +88,27 @@ def search_db(max_price_usd, district):
     if district == "Hammasi":
         c.execute('SELECT title, price_str, location, link, image FROM listings WHERE price_usd <= ? ORDER BY price_usd ASC', (max_price_usd,))
     else:
-        c.execute('SELECT title, price_str, location, link, image FROM listings WHERE price_usd <= ? AND location LIKE ? ORDER BY price_usd ASC', (max_price_usd, f'%{district}%'))
+        # Ham o'zbekcha, ham ruscha nomlar bo'yicha qidiramiz
+        names = DISTRICT_MAP.get(district, [district])
+        like_queries = " OR ".join(["location LIKE ?"] * len(names))
+        params = [f'%{name}%' for name in names]
+        params.append(max_price_usd)
+        
+        query = f'SELECT title, price_str, location, link, image FROM listings WHERE ({like_queries}) AND price_usd <= ? ORDER BY price_usd ASC'
+        c.execute(query, tuple(params))
         
     results = c.fetchall()
+    
+    # Bazada jami qancha e'lon borligini tekshiramiz
+    c.execute('SELECT COUNT(*) FROM listings')
+    total_in_db = c.fetchone()[0]
+    
     conn.close()
-    return results
+    return results, total_in_db
 
-# --- 2. FON REJIMIDA APIFY'DAN YUKLASH ---
+# --- FON REJIMIDA APIFY'DAN YUKLASH ---
 def background_scraper():
-    time.sleep(5) # Server to'liq ishga tushishini kutamiz
+    time.sleep(3)
     while True:
         print("Fon rejimida OLX ma'lumotlari yuklanmoqda...")
         try:
@@ -96,7 +116,7 @@ def background_scraper():
             run_input = {
                 "country": "uz",
                 "queries": ["kvartira sotiladi Toshkent"],
-                "maxItems": 500, # 500 ta eng yangi e'lonni yuklaymiz
+                "maxItems": 500, 
                 "mode": "scrape"
             }
             run = client.actor("datahamster/olx-europe-listings").call(run_input=run_input)
@@ -106,9 +126,9 @@ def background_scraper():
             print(f"Fon yuklashda xatolik: {e}")
         
         print("Keyingi yuklash 2 soatdan keyin...")
-        time.sleep(7200) # 2 soat kutadi
+        time.sleep(7200)
 
-# --- FLASK SERVER (Webhook uchun) ---
+# --- FLASK SERVER ---
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
 def receive_update():
     json_string = request.get_data().decode('utf-8')
@@ -148,7 +168,8 @@ def ask_district(message):
         user_states[user_id] = {'state': 'waiting_for_district', 'budget': max_price}
         
         markup = types.InlineKeyboardMarkup(row_width=2)
-        buttons = [types.InlineKeyboardButton(text=dist, callback_data=f"dist_{dist}") for dist in TASHKENT_DISTRICTS]
+        buttons = [types.InlineKeyboardButton(text=dist, callback_data=f"dist_{dist}") for dist in DISTRICT_MAP.keys()]
+        buttons.append(types.InlineKeyboardButton(text="Hammasi", callback_data="dist_Hammasi"))
         markup.add(*buttons)
         
         bot.send_message(user_id, "📍 <b>2-qadam:</b> Qaysi tumandan qidiramiz?\nQuyidagi ro'yxatdan tanlang 👇", reply_markup=markup, parse_mode='HTML')
@@ -168,19 +189,35 @@ def handle_district_choice(call):
     max_price = user_states[user_id]['budget']
     bot.answer_callback_query(call.id)
     
-    # Bazadan qidirish (BU JUDA TEZ ISHLAYDI)
-    results = search_db(max_price, district)
+    results, total_in_db = search_db(max_price, district)
     
+    # Agar baza umuman bo'sh bo'lsa (yangi deploy bo'lgan bo'lsa)
+    if total_in_db == 0:
+        bot.edit_message_text(
+            chat_id=user_id, message_id=call.message.message_id, 
+            text=f"⏳ <b>Ma'lumotlar bazasi hozir yuklanmoqda...</b>\n\n"
+                 f"Server yaqinda ishga tushgani uchun OLX'dan ma'lumotlar yuklanmoqda. "
+                 f"Iltimos, <b>15 soniyadan so'ng</b> qaytadan urinib ko'ring.", 
+            parse_mode='HTML'
+        )
+        return
+    
+    if not results:
+        bot.edit_message_text(
+            chat_id=user_id, message_id=call.message.message_id, 
+            text=f"🎉 <b>{district}</b> tumanidan <b>{max_price}$</b> gacha topilgan uylar (Jami: 0 ta):\n\n"
+                 f"😔 Afsuski, hozircha bu tumandan mos uy topilmadi.\n"
+                 f"<i>(Bazada jami {total_in_db} ta uy bor, lekin ular narxga yoki tumanga mos kelmadi).</i>", 
+            parse_mode='HTML'
+        )
+        return
+        
     bot.edit_message_text(
         chat_id=user_id, message_id=call.message.message_id, 
         text=f"🎉 <b>{district}</b> tumanidan <b>{max_price}$</b> gacha topilgan uylar (Jami: {len(results)} ta):", 
         parse_mode='HTML'
     )
     
-    if not results:
-        bot.send_message(user_id, f"😔 Afsuski, bazamizdan <b>{district}</b> tumanidan <b>{max_price}$</b> gacha uy topilmadi.\n<i>Baza har 2 soatda yangilanadi. Keyinroq urinib ko'ring.</i>", parse_mode='HTML')
-        return
-        
     for res in results[:15]:
         title, price_str, location, link, image = res
         text = f"🏢 <b>{title}</b>\n\n💵 Narxi: <code>{price_str}</code>\n📍 Manzil: {location}\n"
@@ -203,7 +240,6 @@ def handle_district_choice(call):
 # --- ISHGA TUSHIRISH ---
 if __name__ == "__main__":
     init_db()
-    # Fon rejimidagi yuklovchini ishga tushirish
     threading.Thread(target=background_scraper, daemon=True).start()
     
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
